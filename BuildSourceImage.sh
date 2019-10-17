@@ -48,6 +48,16 @@ _init() {
     done
 }
 
+cleanup() {
+    local ret=$?
+    if [ ${ret} -ne 0 ] ; then
+        echo ""
+        _warn "cleaning up"
+    fi
+    exit "${ret}"
+}
+trap "cleanup" EXIT TERM KILL
+
 # enable access to some of functions as subcommands!
 _subcommand() {
     local command="${1}"
@@ -1060,6 +1070,8 @@ main() {
     local src_name
     local unpack_dir
     local work_dir
+
+sleep 10
 
     _init "${@}"
     _subcommand "${@}"

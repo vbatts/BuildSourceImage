@@ -14,7 +14,7 @@ _version() {
 # output the cli usage and exit
 _usage() {
     _version
-    echo "Usage: $(basename "$0") [-D] [-b <path>] [-c <path>] [-e <path>] [-r <path>] [-o <path>] [-i <image>] [-p <image>] [-l] [-d <drivers>]"
+    echo "Usage: $(basename "$0") [-D] [-b <path>] [-c <path>] [-e <path>] [-r <path>] [-o <path>] [-i <image path>] [-l] [-d <drivers>]"
     echo ""
     echo "          Container Source Image tool"
     echo ""
@@ -25,8 +25,7 @@ _usage() {
     echo -e "       -o <path>\toutput the OCI image to path. Can be provided via OUTPUT_DIR env variable"
     echo -e "       -d <drivers>\tenumerate specific source drivers to run"
     echo -e "       -l\t\tlist the source drivers available"
-    echo -e "       -i <image>\timage reference to fetch and inspect its rootfs to derive sources"
-    echo -e "       -p <image>\tpush source image to specified reference after build"
+    echo -e "       -i <image path>\tpath to an 'oci:...' image reference to inspect its rootfs to derive sources"
     echo -e "       -D\t\tdebuging output. Can be set via DEBUG env variable"
     echo -e "       -h\t\tthis usage information"
     echo -e "       -v\t\tversion"
@@ -39,6 +38,13 @@ _usage() {
 # sanity checks on startup
 _init() {
     set -o pipefail
+
+    # TODO this happens _before_ the `-D` flag is parsed, so the verbose bash
+    # output is only shown if the user passes `DEBUG=1` _not_ just the `-D`
+    # flag.
+    if [ -n "${DEBUG}" ] ; then
+        set -x
+    fi
 
     # check for tools we depend on
     for cmd in jq skopeo dnf file find tar stat date ; do
@@ -61,6 +67,12 @@ _subcommand() {
         unpack)
             # (vb) i'd prefer this subcommand directly match the function name, but it isn't as pretty.
             unpack_img "${@}"
+            ret=$?
+            exit "${ret}"
+            ;;
+        skopeo)
+            # (vb) this is to handle the container ENTRYPOINT pass through
+            skopeo "${@}"
             ret=$?
             exit "${ret}"
             ;;
@@ -218,104 +230,6 @@ parse_img_tag() {
 }
 
 #
-# an inline prefixer for containers/image tools
-#
-ref_prefix() {
-    local ref="${1}"
-    local pfxs
-    local ret
-
-    # get the supported prefixes of the current version of skopeo
-    mapfile -t pfxs < <(skopeo copy --help | grep -A1 "Supported transports:" | grep -v "Supported transports" | sed 's/, /\n/g')
-    ret=$?
-    if [ ${ret} -ne 0 ] ; then
-        return ${ret}
-    fi
-
-    for pfx in "${pfxs[@]}" ; do
-        if echo "${ref}" | grep -q "^${pfx}:" ; then
-            # break if we match a known prefix
-            echo "${ref}"
-            return 0
-        fi
-    done
-    # else default
-    echo "docker://${ref}"
-}
-
-#
-# an inline namer for the source image
-# Initially this is a tagging convention (which if we try estesp/manifest-tool
-# can be directly mapped into a manifest-list/image-index).
-#
-ref_src_img_tag() {
-    local ref="${1}"
-    echo -n "$(parse_img_tag "${ref}")""${source_image_suffix}"
-}
-
-#
-# call out to registry for the image reference's digest checksum
-#
-fetch_img_digest() {
-    local ref="${1}"
-    local dgst
-    local ret
-
-    ## TODO: check for authfile, creds, and whether it's an insecure registry
-    dgst=$(skopeo inspect "$(ref_prefix "${ref}")" | jq .Digest | tr -d \")
-    ret=$?
-    if [ $ret -ne 0 ] ; then
-        echo "ERROR: check the image reference: ${ref}" >&2
-        return $ret
-    fi
-
-    echo -n "${dgst}"
-}
-
-#
-# pull down the image to an OCI layout
-# arguments: image ref
-# returns: path:tag to the OCI layout
-#
-# any commands should only output to stderr, so that the caller can receive the
-# path reference to the OCI layout.
-#
-fetch_img() {
-    local ref="${1}"
-    local dst="${2}"
-    local base
-    local tag
-    local dgst
-    local from
-    local ret
-
-    _mkdir_p "${dst}"
-
-    base="$(parse_img_base "${ref}")"
-    tag="$(parse_img_tag "${ref}")"
-    dgst="$(parse_img_digest "${ref}")"
-    from=""
-    # skopeo currently only support _either_ tag _or_ digest, so we'll be specific.
-    if [ -n "${dgst}" ] ; then
-        from="$(ref_prefix "${base}")@${dgst}"
-    else
-        from="$(ref_prefix "${base}"):${tag}"
-    fi
-
-    ## TODO: check for authfile, creds, and whether it's an insecure registry
-    ## destination name must have the image tag included (umoci expects it)
-    skopeo \
-        copy \
-        "${from}" \
-        "oci:${dst}:${tag}" >&2
-    ret=$?
-    if [ ${ret} -ne 0 ] ; then
-        return ${ret}
-    fi
-    echo -n "${dst}:${tag}"
-}
-
-#
 # upack_img <oci layout path> <unpack path>
 #
 unpack_img() {
@@ -433,21 +347,6 @@ unpack_img_umoci() {
     _debug "unpacking with umoci"
     # always assume we're not root I reckon
     umoci unpack --rootless --image "${image_dir}" "${unpack_dir}" >&2
-    ret=$?
-    return $ret
-}
-
-#
-# copy an image from one location to another
-#
-push_img() {
-    local src="${1}"
-    local dst="${2}"
-
-    _debug "pushing image ${src} to ${dst}"
-    ## TODO: check for authfile, creds, and whether it's an insecure registry
-    skopeo copy --dest-tls-verify=false "$(ref_prefix "${src}")" "$(ref_prefix "${dst}")" # XXX for demo only
-    #skopeo copy "$(ref_prefix "${src}")" "$(ref_prefix "${dst}")"
     ret=$?
     return $ret
 }
@@ -804,7 +703,6 @@ layout_insert_bash() {
 #   May become a ${ABV_NAME}/drivers.d/
 #
 # Arguments:
-#  * image ref
 #  * path to inspect
 #  * output path for source (specifc to this driver)
 #  * output path for JSON file of source's annotations
@@ -825,10 +723,9 @@ layout_insert_bash() {
 #
 sourcedriver_rpm_fetch() {
     local self="${0#sourcedriver_*}"
-    local ref="${1}"
-    local rootfs="${2}"
-    local out_dir="${3}"
-    local manifest_dir="${4}"
+    local rootfs="${1}"
+    local out_dir="${2}"
+    local manifest_dir="${3}"
     local release
     local rpm
     local srcrpm_buildtime
@@ -911,10 +808,9 @@ sourcedriver_rpm_fetch() {
 #
 sourcedriver_rpm_dir() {
     local self="${0#sourcedriver_*}"
-    local ref="${1}"
-    local rootfs="${2}"
-    local out_dir="${3}"
-    local manifest_dir="${4}"
+    local rootfs="${1}"
+    local out_dir="${2}"
+    local manifest_dir="${3}"
     local srcrpm_buildtime
     local srcrpm_pkgid
     local srcrpm_name
@@ -974,10 +870,9 @@ sourcedriver_rpm_dir() {
 #
 sourcedriver_context_dir() {
     local self="${0#sourcedriver_*}"
-    local ref="${1}"
-    local rootfs="${2}"
-    local out_dir="${3}"
-    local manifest_dir="${4}"
+    local rootfs="${1}"
+    local out_dir="${2}"
+    local manifest_dir="${3}"
     local tarname
     local mimetype
     local source_info
@@ -1015,10 +910,9 @@ sourcedriver_context_dir() {
 #
 sourcedriver_extra_src_dir() {
     local self="${0#sourcedriver_*}"
-    local ref="${1}"
-    local rootfs="${2}"
-    local out_dir="${3}"
-    local manifest_dir="${4}"
+    local rootfs="${1}"
+    local out_dir="${2}"
+    local manifest_dir="${3}"
     local tarname
     local mimetype
     local source_info
@@ -1054,14 +948,11 @@ main() {
     local base_dir
     local input_context_dir
     local input_extra_src_dir
-    local input_inspect_image_ref
+    local input_image_ref
     local input_srpm_dir
     local drivers
-    local image_ref
-    local img_layout
     local list_drivers
     local output_dir
-    local push_image_ref
     local ret
     local rootfs
     local src_dir
@@ -1076,7 +967,7 @@ main() {
 
     base_dir="${BASE_DIR:-$(pwd)/${ABV_NAME}}"
     # using the bash builtin to parse
-    while getopts ":hlvDi:c:s:e:o:b:d:p:" opts; do
+    while getopts ":hlvDi:c:s:e:o:b:d:" opts; do
         case "${opts}" in
             b)
                 base_dir="${OPTARG}"
@@ -1095,16 +986,13 @@ main() {
                 exit 0
                 ;;
             i)
-                input_inspect_image_ref=${OPTARG}
+                input_image_ref=${OPTARG}
                 ;;
             l)
                 list_drivers=1
                 ;;
             o)
                 output_dir=${OPTARG}
-                ;;
-            p)
-                push_image_ref=${OPTARG}
                 ;;
             s)
                 input_srpm_dir=${OPTARG}
@@ -1154,64 +1042,30 @@ main() {
 
     # setup rootfs to be inspected (if any)
     rootfs=""
-    image_ref=""
-    src_dir=""
+    src_dir="$(_mktemp_d)"
     work_dir="${base_dir}/work"
-    if [ -n "${input_inspect_image_ref}" ] ; then
-        _debug "Image Reference provided: ${input_inspect_image_ref}"
-        _debug "Image Reference base: $(parse_img_base "${input_inspect_image_ref}")"
-        _debug "Image Reference tag: $(parse_img_tag "${input_inspect_image_ref}")"
-
-        inspect_image_digest="$(parse_img_digest "${input_inspect_image_ref}")"
-        # determine missing digest before fetch, so that we fetch the precise image
-        # including its digest.
-        if [ -z "${inspect_image_digest}" ] ; then
-            inspect_image_digest="$(fetch_img_digest "$(parse_img_base "${input_inspect_image_ref}"):$(parse_img_tag "${input_inspect_image_ref}")")"
-            ret=$?
-            if [ ${ret} -ne 0 ] ; then
-                _error "failed to detect image digest"
-            fi
-        fi
-        _debug "inspect_image_digest: ${inspect_image_digest}"
-
-        img_layout=""
-        # if inspect and fetch image, then to an OCI layout dir
-        if [ ! -d "${work_dir}/layouts/${inspect_image_digest/:/\/}" ] ; then
-            # we'll store the image to a path based on its digest, that it can be reused
-            img_layout="$(fetch_img "$(parse_img_base "${input_inspect_image_ref}")":"$(parse_img_tag "${input_inspect_image_ref}")"@"${inspect_image_digest}" "${work_dir}"/layouts/"${inspect_image_digest/:/\/}" )"
-            ret=$?
-            if [ ${ret} -ne 0 ] ; then
-                _error "failed to copy image: $(parse_img_base "${input_inspect_image_ref}"):$(parse_img_tag "${input_inspect_image_ref}")@${inspect_image_digest}"
-            fi
-        else
-            img_layout="${work_dir}/layouts/${inspect_image_digest/:/\/}:$(parse_img_tag "${input_inspect_image_ref}")"
-        fi
-        _debug "image layout: ${img_layout}"
+    if [ -n "${input_image_ref}" ] ; then
+        _debug "Image Reference provided: ${input_image_ref}"
+        _debug "Image Reference base: $(parse_img_base "${input_image_ref}")"
+        _debug "Image Reference tag: $(parse_img_tag "${input_image_ref}")"
+        exit
 
         # unpack or reuse fetched image
-        unpack_dir="${work_dir}/unpacked/${inspect_image_digest/:/\/}"
+        unpack_dir="${work_dir}/unpacked/"
         if [ -d "${unpack_dir}" ] ; then
             _rm_rf "${unpack_dir}"
         fi
-        unpack_img "${img_layout}" "${unpack_dir}"
+        unpack_img "$(parse_img_base "${input_image_ref}")$(parse_img_tag "${input_image_ref}")" "${unpack_dir}"
         ret=$?
         if [ ${ret} -ne 0 ] ; then
             return ${ret}
         fi
 
         rootfs="${unpack_dir}/rootfs"
-        image_ref="$(parse_img_base "${input_inspect_image_ref}"):$(parse_img_tag "${input_inspect_image_ref}")@${inspect_image_digest}"
-        src_dir="${base_dir}/src/${inspect_image_digest/:/\/}"
-        work_dir="${base_dir}/work/${inspect_image_digest/:/\/}"
-        _info "inspecting image reference ${image_ref}"
     else
         # if we're not fething an image, then this is basically a nop
         rootfs="$(_mktemp_d)"
-        image_ref="scratch"
-        src_dir="$(_mktemp_d)"
-        work_dir="$(_mktemp_d)"
     fi
-    _debug "image layout: ${img_layout}"
     _debug "rootfs dir: ${rootfs}"
 
     # clear prior driver's info about source to insert into Source Image
@@ -1225,7 +1079,14 @@ main() {
     fi
 
     # Prep the OCI layout for the source image
-    src_img_dir="$(_mktemp_d)"
+    if [ -n "${output_dir}" ] ; then
+        # XXX not sure how to hand the behavior of this getting passed into the
+        # container as a bind-mount, if the layout_new functions need to _rm_rf
+        # and _mkdir_p ...
+        src_img_dir="${output_dir}"
+    else
+        src_img_dir="$(_mktemp_d)"
+    fi
     src_img_tag="latest-source" # XXX this tag needs to be a reference to the image built from
     layout_new "${src_img_dir}" "${src_img_tag}"
 
@@ -1237,7 +1098,6 @@ main() {
         _mkdir_p "${src_dir}/${driver#sourcedriver_*}"
         _mkdir_p "${work_dir}/driver/${driver#sourcedriver_*}"
         $driver \
-            "${image_ref}" \
             "${rootfs}" \
             "${src_dir}/${driver#sourcedriver_*}" \
             "${work_dir}/driver/${driver#sourcedriver_*}"
@@ -1268,21 +1128,6 @@ main() {
     # TODO maybe look to a directory like /usr/libexec/BuildSourceImage/drivers/ for drop-ins to run
 
     _info "succesfully packed 'oci:${src_img_dir}:${src_img_tag}'"
-    _debug "$(skopeo inspect oci:"${src_img_dir}":"${src_img_tag}")"
-
-    ## if an output directory is provided then save a copy to it
-    if [ -n "${output_dir}" ] ; then
-        _mkdir_p "${output_dir}"
-        # XXX this $input_inspect_image_ref currently relies on the user passing in the `-i` flag
-        push_img "oci:$src_img_dir:${src_img_tag}" "oci:$output_dir:$(ref_src_img_tag "$(parse_img_tag "${input_inspect_image_ref}")")"
-        _info "copied to oci:$output_dir:$(ref_src_img_tag "$(parse_img_tag "${input_inspect_image_ref}")")"
-    fi
-
-    if [ -n "${push_image_ref}" ] ; then
-        # XXX may have to parse this reference to ensure it is valid, and that it has a `-source` tag
-        push_img "oci:$src_img_dir:${src_img_tag}" "${push_image_ref}"
-    fi
-
 }
 
 # only exec main if this is being called (this way we can source and test the functions)
